@@ -8,6 +8,7 @@ import time
 from collections import deque
 from typing import BinaryIO, Callable, Deque, Dict, List, Optional, Union, cast, Tuple
 from urllib.parse import urlparse
+import socket
 
 import wsproto
 import wsproto.events
@@ -27,40 +28,20 @@ from aioquic.h3.events import (
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.tls import CipherSuite, SessionTicket
 from aioquic.quic.events import DatagramFrameReceived, ProtocolNegotiated, QuicEvent, StreamDataReceived, ConnectionTerminated, PingAcknowledged, HandshakeCompleted, ConnectionIdIssued
-
+from fl_model import create_keras_model
+from common import send_model_weights, get_model_weights
 try:
     import uvloop
 except ImportError:
     uvloop = None
-
-
-HttpConnection = Union[H0Connection, H3Connection]
-
-USER_AGENT = "aioquic/" + aioquic.__version__
+with open('EMNINST.pickle', 'rb') as fp:
+    DATA = pickle.load(fp)
+    KEYS = iter(DATA)
 
 
 class NewProtocol(QuicConnectionProtocol):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-
-    # def transmit(self) -> None:
-    #     """
-    #     Send pending datagrams to the peer and arm the timer if needed.
-    #     """
-    #     self._transmit_task = None
-
-    #     # send datagrams
-    #     for data, addr in self._quic.datagrams_to_send(now=self._loop.time()):
-    #         self._transport.sendto(data, addr)
-
-    #     # re-arm timer
-    #     timer_at = self._quic.get_timer()
-    #     if self._timer is not None and self._timer_at != timer_at:
-    #         self._timer.cancel()
-    #         self._timer = None
-    #     if self._timer is None and timer_at is not None:
-    #         self._timer = self._loop.call_at(timer_at, self._handle_timer)
-    #     self._timer_at = timer_at
 
     def quic_event_received(self, event: QuicEvent) -> None:
         """
@@ -69,23 +50,45 @@ class NewProtocol(QuicConnectionProtocol):
         """
         # FIXME: move this to a subclass
         if isinstance(event, ConnectionTerminated):
+            print(event)
             for reader in self._stream_readers.values():
                 reader.feed_eof()
         elif isinstance(event, StreamDataReceived):
+            print(len(event.data))
             reader = self._stream_readers.get(event.stream_id, None)
             if reader is None:
-                print('----------')
                 reader, writer = self._create_stream(event.stream_id)
                 self._stream_handler(reader, writer)
             reader.feed_data(event.data)
             if event.end_stream:
                 reader.feed_eof()
 
-        # elif isinstance(event, HandshakeCompleted):
-        #     print(event)
-        #     reader, writer = self.create_stream()
-        #     writer.write(b'Hello server')
-        #     # self._quic.send_stream_data(stream_id, b'Hello server', False)
+
+def save_session_ticket(ticket: SessionTicket) -> None:
+    """
+    Callback which is invoked by the TLS engine when a new session ticket
+    is received.
+    """
+    logging.info("New session ticket received")
+    if session_ticket_path:
+        with open(session_ticket_path, "wb") as fp:
+            pickle.dump(ticket, fp)
+
+
+async def train_one_round(model, reader, writer):
+    writer.write(b'Ready for training\n')
+    model_weights = await get_model_weights(reader, writer)
+    model.set_weights(model_weights)
+    # Load data
+    x_train, y_train = DATA[next(KEYS)]
+    # Start training
+    writer.write(b'Start model train\n')
+    model.fit(x_train, y_train, epochs=15, batch_size=40, validation_split=0.2)
+    writer.write(b'Finished Training\n')
+    # Wait for server to ack
+    line = await reader.readline()
+    if line == b'Send new weights\n':
+        return await send_model_weights(model.get_weights(), reader, writer)
 
 
 async def run(configuration: QuicConfiguration, host: str, port: int) -> None:
@@ -93,41 +96,24 @@ async def run(configuration: QuicConfiguration, host: str, port: int) -> None:
         host,
         port,
         configuration=configuration,
-        create_protocol=NewProtocol
+        # create_protocol=NewProtocol,
+        session_ticket_handler=save_session_ticket,
     ) as client:
-        # await client.wait_connected()
-        # await client.ping()
         reader, writer = await client.create_stream()
-        print('----------')
-        print(client._transmit_task)
-        writer.write(b'Hello server')
-        for i in range(5):
-            writer.write(b'Hello\n')
-            # line = await reader.readline()
-            # print(line)
-            # client.transmit()
-            # print('Client sent Hello wait response')
-            # line = await reader.readline()
-            # print('client response received')
-            # print(line)
-            # time.sleep(1)
-        # client.transmit()
-
-        print('Client sent Last wait response')
-        writer.write(b'Last\n')
-        print('sent')
-        #
+        model = create_keras_model()
+        # writer.write(b'Ready to work\n')
+        # while True:
+        #     line = await reader.readline()
+        #     if line == b'Proceed to Training\n':
+        #         break
+        i = 20
+        while i:
+            tmp = await train_one_round(model, reader, writer)
+            if tmp:
+                i -= 1
         writer.write_eof()
         print('sent eof')
-        print((await reader.read()).decode())
-        # print('client response received')
-        # line = await reader.readline()
-        # print(line)
-        # line = '1'
-        # while line:
-        #     print(1)
-        #     line = await reader.readline()
-        #     print(line)
+        print((await reader.read()))
         client.close()
         await client.wait_closed()
         print('closed conn')
@@ -142,13 +128,21 @@ if __name__ == "__main__":
 
     # prepare configuration
     configuration = QuicConfiguration(
-        is_client=True
+        is_client=True,
+        idle_timeout=185.0
     )
 
     configuration.verify_mode = ssl.CERT_NONE
 
     configuration.quic_logger = QuicDirectoryLogger(
         "C:\\Users\\Eugen\\OneDrive - King's College London\\thesis\\model\\quic\\logs")
+    session_ticket_path = 'session_ticket.tick'
+    try:
+        with open(session_ticket_path, "rb") as fp:
+            logging.info('Loading session ticket')
+            configuration.session_ticket = pickle.load(fp)
+    except FileNotFoundError:
+        pass
 
     loop = asyncio.get_event_loop()
     loop.run_until_complete(
