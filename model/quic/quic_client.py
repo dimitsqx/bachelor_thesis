@@ -54,7 +54,6 @@ class NewProtocol(QuicConnectionProtocol):
             for reader in self._stream_readers.values():
                 reader.feed_eof()
         elif isinstance(event, StreamDataReceived):
-            print(len(event.data))
             reader = self._stream_readers.get(event.stream_id, None)
             if reader is None:
                 reader, writer = self._create_stream(event.stream_id)
@@ -76,7 +75,6 @@ def save_session_ticket(ticket: SessionTicket) -> None:
 
 
 async def train_one_round(model, reader, writer):
-    writer.write(b'Ready for training\n')
     model_weights = await get_model_weights(reader, writer)
     model.set_weights(model_weights)
     # Load data
@@ -84,7 +82,7 @@ async def train_one_round(model, reader, writer):
     # Start training
     writer.write(b'Start model train\n')
     model.fit(x_train, y_train, epochs=15, batch_size=40, validation_split=0.2)
-    writer.write(b'Finished Training\n')
+    writer.write(b'Finished Round\n')
     # Wait for server to ack
     line = await reader.readline()
     if line == b'Send new weights\n':
@@ -96,21 +94,25 @@ async def run(configuration: QuicConfiguration, host: str, port: int) -> None:
         host,
         port,
         configuration=configuration,
-        # create_protocol=NewProtocol,
+        create_protocol=NewProtocol,
         session_ticket_handler=save_session_ticket,
     ) as client:
         reader, writer = await client.create_stream()
-        model = create_keras_model()
-        # writer.write(b'Ready to work\n')
         # while True:
-        #     line = await reader.readline()
-        #     if line == b'Proceed to Training\n':
+        #     line= await reader.readline()
+        #     if line==b'Prepare for training\n':
         #         break
-        i = 20
-        while i:
-            tmp = await train_one_round(model, reader, writer)
-            if tmp:
-                i -= 1
+        model = create_keras_model()
+        writer.write(b'Ready to work\n')
+        print(client._quic.host_cid)
+        print(client._quic._peer_cid)
+
+        while not reader.at_eof():
+            print('-------------------')
+            line = await reader.readline()
+            print(line)
+            if line == b'Proceed to Training\n':
+                tmp = await train_one_round(model, reader, writer)
         writer.write_eof()
         print('sent eof')
         print((await reader.read()))
@@ -128,8 +130,7 @@ if __name__ == "__main__":
 
     # prepare configuration
     configuration = QuicConfiguration(
-        is_client=True,
-        idle_timeout=185.0
+        is_client=True
     )
 
     configuration.verify_mode = ssl.CERT_NONE
