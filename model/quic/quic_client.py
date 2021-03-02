@@ -5,6 +5,7 @@ import os
 import pickle
 import ssl
 import time
+import tensorflow as tf
 from collections import deque
 from typing import BinaryIO, Callable, Deque, Dict, List, Optional, Union, cast, Tuple
 from urllib.parse import urlparse
@@ -34,7 +35,7 @@ try:
     import uvloop
 except ImportError:
     uvloop = None
-with open('EMNINST.pickle', 'rb') as fp:
+with open('model/quic/EMNINST.pickle', 'rb') as fp:
     DATA = pickle.load(fp)
     KEYS = iter(DATA)
 
@@ -86,7 +87,9 @@ async def train_one_round(model, reader, writer):
     # Wait for server to ack
     line = await reader.readline()
     if line == b'Send new weights\n':
-        return await send_model_weights(model.get_weights(), reader, writer)
+        sent_weights = await send_model_weights(model.get_weights(), reader, writer)
+        print('send sample size')
+        writer.write('{0}\n'.format(len(x_train)).encode())
 
 
 async def run(configuration: QuicConfiguration, host: str, port: int) -> None:
@@ -104,11 +107,10 @@ async def run(configuration: QuicConfiguration, host: str, port: int) -> None:
         #         break
         model = create_keras_model()
         writer.write(b'Ready to work\n')
-        print(client._quic.host_cid)
-        print(client._quic._peer_cid)
+        # print(client._quic.host_cid)
+        # print(client._quic._peer_cid)
 
         while not reader.at_eof():
-            print('-------------------')
             line = await reader.readline()
             print(line)
             if line == b'Proceed to Training\n':
@@ -144,12 +146,12 @@ if __name__ == "__main__":
             configuration.session_ticket = pickle.load(fp)
     except FileNotFoundError:
         pass
-
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(
-        run(
-            configuration=configuration,
-            host='localhost',
-            port=4433
+    with tf.device('cpu:0'):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(
+            run(
+                configuration=configuration,
+                host='localhost',
+                port=4433
+            )
         )
-    )

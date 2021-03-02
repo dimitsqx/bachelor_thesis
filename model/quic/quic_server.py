@@ -34,7 +34,7 @@ try:
 except ImportError:
     uvloop = None
 
-with open('EMNINST.pickle', 'rb') as fp:
+with open('model/quic/EMNINST.pickle', 'rb') as fp:
     a = pickle.load(fp)
     for i in range(100):
         key = next(iter(a))
@@ -50,7 +50,6 @@ class Server(QuicServer):
 
     def __init__(self, keras_model: tf.keras.models.Model, model_weights_path: str = None, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        print('in init')
         self.fl_model = keras_model
         self.model_weights = self.fl_model.load_weights(
             model_weights_path) if model_weights_path is not None else self.fl_model.get_weights()
@@ -59,165 +58,134 @@ class Server(QuicServer):
             'performance_clients': []
         }
         self.train_flag = False
-        self.server_task = self._loop.create_task(self.train_model())
+        self.server_task = self._loop.create_task(self._create_server_task())
 
-    async def train_model(self, num_rounds=10):
-        print('in train model')
-        min_clients = 1
+    async def _create_server_task(self):
+        '''Create running task for training
+        '''
         while True:
-            print('in while')
-            client_proto = set()
-            for cid, proto in self._protocols.items():
-                if proto not in client_proto:
-                    client_proto.add(proto)
-            print(client_proto)
-            if len(client_proto) >= min_clients:
-                print('-----------------')
-                train_clients = random.sample(client_proto, min_clients)
-                print(train_clients)
-                other_clients = client_proto.difference(train_clients)
-                print(other_clients)
+            await asyncio.sleep(10)
+            await self.train_model(self.find_clients())
+
+    def find_clients(self):
+        client_protocols = set()
+        for cid, proto in self._protocols.items():
+            if proto not in client_protocols:
+                client_protocols.add(proto)
+        return client_protocols
+
+    async def train_model(self, client_protocols, num_rounds=10, min_clients=3):
+        '''Function called by the server to train the model
+        '''
+        print(client_protocols)
+        if len(client_protocols) >= min_clients:
+            # Sample min_clients
+            train_clients = random.sample(client_protocols, min_clients)
+            print(train_clients)
+            # Get remaining clients
+            other_clients = client_protocols.difference(train_clients)
+            print(other_clients)
+            # Create task to make others wait
+            if other_clients:
                 wait_task = self._loop.create_task(
-                    self.say_wait(other_clients))
-                print('----------------------')
-                self.fl_model.set_weights(self.model_weights)
-                a = self.fl_model.evaluate(X_TEST, Y_TEST)
-                # print(a)
-                self.performance_hystory['performance_server'].append(a)
-                for rnd in range(num_rounds):
-                    a = await self.fit_round(client_proto, rnd)
-                    # print(a)
+                    self.signal_waiting(other_clients))
+            self.fl_model.set_weights(self.model_weights)
+            # evaluate model
+            eval_results = self.fl_model.evaluate(X_TEST, Y_TEST)
+            # append to history
+            self.performance_hystory['performance_server'].append(eval_results)
+            # Train for number of rounds
+            for rnd in range(num_rounds):
+                if client_protocols.issubset(self.find_clients()):
+                    # Get the tasks for client
+                    fit_tasks = await self.fit_round(train_clients, rnd)
+                    sample_size = sum(task.result()[1]
+                                      for task in fit_tasks if task.result())
+                    new_weights = []
+                    # Add the weighted weights from each client
+                    for task in fit_tasks:
+                        results = task.result()
+                        if results:
+                            weighted = []
+                            for layer in results[0]:
+                                weighted.append((results[1]/sample_size)*layer)
+                            if not new_weights:
+                                new_weights = weighted
+                            else:
+                                for index in range(len(new_weights)):
+                                    new_weights[index] += weighted[index]
+                    if new_weights:
+                        self.model_weights = new_weights
+                else:
+                    logging.info(
+                        'Finished on round %s because not all clients are available', str(rnd))
+                    break
+            # self.finish_training(train_clients)
+
+            if other_clients:
                 wait_task.cancel()
-            else:
-                for client in client_proto:
-                    print(client._quic._streams.keys())
-                    stream_id = min(client._quic._streams.keys())
-                    reader, writer = client._stream_transport.get(stream_id)
-                    writer.write(b'Wait for instructions\n')
-                await asyncio.sleep(10)
+                try:
+                    await wait_task
+                except asyncio.CancelledError:
+                    logging.info("wait_task is cancelled now")
+        else:
+            # Wait for min clients
+            await self.say_wait(client_protocols)
+
+    def finish_training(self, clients):
+        for client in clients:
+            stream_id = min(client._quic._streams.keys())
+            reader, writer = client._stream_transport.get(stream_id)
+            writer.write_eof()
 
     async def fit_round(self, clients, rnd):
-        print('Training round ', str(rnd))
+        logging.info('Training round %s', str(rnd))
         tasks = []
+        # Create tasks for each client
         for client in clients:
             tasks.append(self._loop.create_task(self.train(client)))
+        # wait for tasks to finish
         for task in tasks:
-            print(task)
             await task
         return tasks
 
     async def train(self, client):
-        print('train task')
-        stream_id = stream_id = min(client._quic._streams.keys())
-        reader, writer = client._stream_transport.get(stream_id)
-        writer.write(b'Proceed to Training\n')
-        print('sending weights')
-        ans = await send_model_weights(self.model_weights, reader, writer)
-        print('got answer', ans)
-        if ans:
-            while True:
-                # wait for training to finish
-                line = await reader.readline()
-                print(line)
-                if line == b'Finished Round\n':
-                    writer.write(b'Send new weights\n')
-                    break
-            new_model_weights = await get_model_weights(reader, writer)
-            print('got model_weights')
-            self.model_weights = new_model_weights
-        else:
-            pass
+        '''One round of training for a client
+        '''
+        try:
+            # get stream id
+            stream_id = min(client._quic._streams.keys())
+            # get the reader and writer
+            reader, writer = client._stream_transport.get(stream_id)
+            writer.write(b'Proceed to Training\n')
 
-        return
+            ans = await send_model_weights(self.model_weights, reader, writer)
+            if ans:
+                while True:
+                    # wait for training to finish
+                    line = await asyncio.wait_for(reader.readline(), timeout=60)
+                    logging.info(line)
+                    if line == b'Finished Round\n':
+                        writer.write(b'Send new weights\n')
+                        break
+                new_model_weights = await get_model_weights(reader, writer)
+                # get sample size
+                line = await asyncio.wait_for(reader.readline(), timeout=60)
+                sample_size = int(line)
+                return (new_model_weights, sample_size)
+        except asyncio.TimeoutError:
+            logging.warning('One client did not respond in time')
 
     async def say_wait(self, clients):
+        for client in clients:
+            stream_id = min(client._quic._streams.keys())
+            reader, writer = client._stream_transport.get(stream_id)
+            writer.write(b'Wait for instructions\n')
+        await asyncio.sleep(10)
+
+    async def signal_waiting(self, clients):
         while True:
-            print('Signaling other to wait')
-            for client in clients:
-                print(client._quic._streams.keys())
-                stream_id = min(client._quic._streams.keys())
-                # client._quic.send_stream_data(
-                #     stream_id, b'Wait for instructions\n')
-                reader, writer = client._stream_transport.get(stream_id)
-                writer.write(b'Wait for instructions\n')
-            await asyncio.sleep(10)
-
-
-# class FLServer:
-
-#     def __init__(self, keras_model: tf.keras.models.Model, model_weights_path: str = None, *args, **kwargs):
-#         # super().__init__(*args, **kwargs)
-#         self._loop = asyncio.get_event_loop()
-#         self.fl_model = keras_model
-#         self.model_weights = self.fl_model.load_weights(
-#             model_weights_path) if model_weights_path is not None else self.fl_model.get_weights()
-#         # create QUIC logger
-
-#         self.quic_logger = QuicDirectoryLogger(
-#             "C:\\Users\\Eugen\\OneDrive - King's College London\\thesis\\model\\quic\\logs")
-
-#         self.quic_configuration = QuicConfiguration(
-#             is_client=False,
-#             quic_logger=self.quic_logger,
-#             idle_timeout=185.0
-#         )
-
-#         # load SSL certificate and key
-#         self.quic_configuration.load_cert_chain("c:/Users/Eugen/OneDrive - King's College London/thesis/model/quic/ssl_cert.pem",
-#                                                 "c:/Users/Eugen/OneDrive - King's College London/thesis/model/quic/ssl_key.pem")
-
-#         self.ticket_store = SessionTicketStore()
-
-#     def stream_handler(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-#         print('Create stream')
-#         self._loop.create_task(self._stream_handler(reader, writer))
-
-#     async def _stream_handler(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-#         status = False
-#         while True:
-#             if reader.at_eof():
-#                 writer.write_eof()
-#                 print('break async')
-#                 break
-#             line = await reader.readline()
-#             print(line)
-#             # if line==b'Ready to work\n':
-#             #     while not status:
-#             #         time.sleep(10)
-#             #         writer.write(b'Wait your turn\n')
-
-#             if line == b'Ready for training\n':
-#                 await send_model_weights(self.model_weights, reader, writer)
-#             elif line == b'Finished Training\n':
-#                 writer.write(b'Send new weights\n')
-#                 new_model_weights = await get_model_weights(reader, writer)
-#                 self.model_weights = new_model_weights
-#                 self.fl_model.set_weights(self.model_weights)
-#                 print(self.fl_model.evaluate(X_TEST, Y_TEST))
-
-#             # writer.write(b'Hello from stream handler\n')
-#             # writer.write(b'')
-#             # if line == b'Last\n':
-#             #     print('write EOF')
-#             #     writer.write_eof()
-#             #     reader.feed_eof()
-
-#     def run(self):
-#         self._loop.run_until_complete(
-#             serve(
-#                 'localhost',
-#                 4433,
-#                 configuration=self.quic_configuration,
-#                 create_protocol=NewProtocol,
-#                 session_ticket_fetcher=self.ticket_store.pop,
-#                 session_ticket_handler=self.ticket_store.add,
-#                 stream_handler=self.stream_handler
-#             )
-#         )
-#         try:
-#             self._loop.run_forever()
-#         except KeyboardInterrupt:
-#             pass
+            await self.say_wait(clients)
 
 
 class NewProtocol(QuicConnectionProtocol):
@@ -307,8 +275,6 @@ if __name__ == "__main__":
         level=logging.INFO,
     )
     with tf.device('cpu:0'):
-        # server = FLServer(create_keras_model())
-        # server.run()
 
         quic_logger = QuicDirectoryLogger(
             "C:\\Users\\Eugen\\OneDrive - King's College London\\thesis\\model\\quic\\logs")
