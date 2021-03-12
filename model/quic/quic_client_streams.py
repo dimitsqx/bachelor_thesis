@@ -42,7 +42,8 @@ with open('model/quic/EMNINST.pickle', 'rb') as fp:
 class NewProtocol(QuicConnectionProtocol):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self._weights_waiter = None
+        self._weights_tasks_waiter = None
+        self._weights_waiter_task = None
         self.training_task = None
         self.model = create_keras_model()
         self.model_weights = self.model.get_weights()
@@ -62,7 +63,7 @@ class NewProtocol(QuicConnectionProtocol):
             for reader in self._stream_readers.values():
                 reader.feed_eof()
         elif isinstance(event, StreamDataReceived):
-            print(event)
+            # print(event)
             self.handle_message(event.data, event.stream_id)
 
     def handle_message(self, message: bytes, stream_id):
@@ -70,97 +71,144 @@ class NewProtocol(QuicConnectionProtocol):
         if self.main_stream is None:
             self.main_stream = stream_id
 
-        messages = message.split(b':')
+        if stream_id == self.main_stream:
+            if message == b'Wait for instructions\n':
+                return logging.info('Waiting')
 
-        if messages[0] == b'Wait for instructions\n':
-            return logging.info('Waiting')
+            if message == b'Sending Weights\n' and self.training_task is None:
+                logging.info('Waiting for weights')
+                # Create tasks to receive weights
+                # Create event that will lock access to the receive tasks untill they are built
+                self._weights_tasks_waiter = self._loop.create_future()
+                # Task to get the weights
+                for index in range(len(self.get_weight_task)):
+                    awaitable = self._loop.create_future()
+                    task = self._loop.create_task(asyncio.wait_for(
+                        asyncio.shield(awaitable), 60))
+                    self.get_weight_task[index] = (awaitable, task)
+                # allow access to get weight tasks
+                logging.info('Created get weights wait objects')
+                self._weights_tasks_waiter.set_result(None)
+                # Check weights received
+                return self._loop.create_task(self.check_weights_received())
 
-        if messages[0] == b'Sending Weights\n' and self.training_task is None:
-            logging.info('Waiting for weights')
-            # Create tasks to receive weights
-            # Create event that will lock access to the receive tasks untill they are built
-            self._weights_waiter = self._loop.create_future()
-            # Task to get the weights
-            for index in range(len(self.get_weight_task)):
-                awaitable = self._loop.create_future()
-                task = self._loop.create_task(asyncio.wait_for(
-                    asyncio.shield(awaitable), 60))
-                self.get_weight_task[index] = (awaitable, task)
-            # allow access to get weight tasks
-            return self._weights_waiter.set_result(None)
-        # if training is not in progress
-        if messages[0] == b'Weights' and self.training_task is None and self._weights_waiter is not None:
-            # Wait for get weights task to build
-            self._loop.run_until_complete(asyncio.shield(self._weights_waiter))
-            # get new weights
-            awaitable, task = self.get_weight_task[int(messages[1].decode())]
-            awaitable.set_result(pickle.loads(messages[2]))
-            # set the layer weights
-            self.model_weights[int(messages[1].decode())
-                               ] = pickle.loads(messages[2])
-            # store the stream id for layer
-            self.weight_streams[int(messages[1].decode())] = stream_id
-            return self.send(b'Received Weights\n', stream_id)
+            if message == b'Proceed to Training\n' and self._weights_tasks_waiter is not None:
+                print(self.model_weights)
+                logging.info('proceding to training')
+                # Reset weights waiter so no new weights can be received
+                self._weights_tasks_waiter = None
+                # Create a task THAT SIGNALS TRAINING
+                self.training_task = self._loop.create_task(
+                    self.say_in_training())
+                # TRAIN FOR ONE ROUND
+                sample_size = self.train_one_round()
+                # Signal the training has finished
+                self.send(b'Finished training. Sending weights back.\n',
+                          self.main_stream)
+                # send sample size
+                self.send(b':'.join([b'Sample', '{0}'.format(
+                    sample_size).encode()]), self.main_stream)
+    #######################################################################################
+                # Send the weights
+                for index, weight in enumerate(self.model_weights):
+                    stream_id = self.weight_streams[index]
+                    # IN case no stream for weights not received
+                    if stream_id is None:
+                        stream_id = self.create_stream()
+                    message = b':'.join(
+                        [b'Weights', str(index).encode(), pickle.dumps(self.model_weights[index])])
+                    # create a task that will signal if the weights were received by server in Timeout
+                    awaitable = self._loop.create_future()
+                    task = self._loop.create_task(
+                        asyncio.wait_for(asyncio.shield(awaitable), 60))
+                    self.send_weight_task[index] = (awaitable, task)
+                    # send weights
+                    self.send(message, stream_id)
 
-        if messages[0] == b'Received Weights\n':
-            # get the layer index for this stream
-            wait_task_index = self.weight_streams.index(stream_id)
-            # get the waiter and task
-            awaitable, task = self.send_weight_task[wait_task_index]
-            # signal that the weights were received
-            return awaitable.set_result(None)
-
-        if messages[0] == b'Proceed to Training\n' and self._weights_waiter is not None:
-            # Wait for all weights to be received in Timeout
-            for index, (awaitable, task) in enumerate(self.get_weight_task):
+                # Cancel task that signals training
+                self.training_task.cancel()
                 try:
-                    self._loop.run_until_complete(task)
-                # if weights are not received in timeout log
-                except asyncio.TimeoutError:
-                    self.get_weight_task[index] = None
-                    logging.info(
-                        'Weights for layer %s were not received', index)
-            # Reset weights waiter so no new weights can be received
-            self._weights_waiter = None
-            # Create a task THAT SIGNALS TRAINING
-            self.training_task = self._loop.create_task(
-                self.say_in_training())
-            # TRAIN FOR ONE ROUND
-            self.train_one_round()
-            # Signal the training has finished
-            self.send(b'Finished training. Sending weights back.\n',
-                      self.main_stream)
-            # Send the weights
-            for index, weight in enumerate(self.model_weights):
-                stream_id = self.weight_streams[index]
-                # IN case no stream for weights not received
-                if stream_id is None:
-                    stream_id = self.create_stream()
-                message = b':'.join(
-                    [b'Weights', str(index).encode(), pickle.dumps(self.model_weights[index])])
-                # create a task that will signal if the weights were received by server in Timeout
-                awaitable = self._loop.create_future()
-                task = self._loop.create_task(
-                    asyncio.wait_for(asyncio.shield(awaitable), 60))
-                self.send_weight_task[index] = (awaitable, task)
-                # send weights
-                self.send(message, stream_id)
+                    self._loop.run_until_complete(self.training_task)
+                except asyncio.CancelledError:
+                    logging.info("Training task is cancelled for %s", self)
+                # Wait for wait received from server
+                for index, (awaitable, task) in enumerate(self.send_weight_task):
+                    try:
+                        self._loop.run_until_complete(task)
+                        self.send_weight_task[index] = None
+                    except asyncio.TimeoutError:
+                        self.send_weight_task[index] = None
+                        logging.info(
+                            'Weights for layer %s were not received by server', index)
+                return
+        else:
+            messages = message.split(b':')
 
-            # Cancel task that signals training
-            self.training_task.cancel()
+            if messages[0] == b'Received Weights\n':
+                # get the layer index for this stream
+                wait_task_index = self.weight_streams.index(stream_id)
+                # get the waiter and task
+                awaitable, task = self.send_weight_task[wait_task_index]
+                # signal that the weights were received
+                return awaitable.set_result(None)
+
+            # if training is not in progress
+            if messages[0] == b'Weights' and self.training_task is None and self._weights_tasks_waiter is not None:
+                # Wait for get weights task to build
+                if not self._weights_tasks_waiter.done():
+                    self._loop.run_until_complete(
+                        asyncio.shield(self._weights_tasks_waiter))
+                # store the stream id for layer
+                self.weight_streams[int(messages[1].decode())] = stream_id
+                # if message als ocontains end
+                if messages[-1] == b'End Weights':
+                    self.model_weights[int(messages[1].decode())] = b':'.join(
+                        messages[2:-1])
+                    # signal received
+                    awaitable, task = self.get_weight_task[int(
+                        messages[1].decode())]
+                    self.model_weights[int(messages[1].decode())] = pickle.loads(
+                        self.model_weights[int(messages[1].decode())])
+                    awaitable.set_result(
+                        self.model_weights[int(messages[1].decode())])
+                    self.send(b'Received Weights\n', stream_id)
+                # set the layer weights
+                else:
+                    self.model_weights[int(messages[1].decode())] = b':'.join(
+                        messages[2:])
+                return
+
+            # When weights are send through multiple messages
+            if stream_id in self.weight_streams:
+                # get the layer index
+                layer = self.weight_streams.index(stream_id)
+
+                # if the receiving of data is not done
+                if not self.get_weight_task[layer][0].done():
+                    # if ende of weights signal
+                    if messages[-1] == b'End Weights':
+                        self.model_weights[layer] += b':'.join(messages[:-1])
+                        awaitable, task = self.get_weight_task[layer]
+                        self.model_weights[layer] = pickle.loads(
+                            self.model_weights[layer])
+                        awaitable.set_result(self.model_weights[layer])
+                        self.send(b'Received Weights\n', stream_id)
+                    else:
+                        self.model_weights[layer] += b':'.join(messages)
+                return
+
+    async def check_weights_received(self):
+        # Wait for all weights to be received in Timeout
+        for index, (awaitable, task) in enumerate(self.get_weight_task):
             try:
-                self._loop.run_until_complete(self.training_task)
-            except asyncio.CancelledError:
-                logging.info("Training task is cancelled for %s", self)
-            # Wait for wait received from server
-            for index, (awaitable, task) in enumerate(self.send_weight_task):
-                try:
-                    self._loop.run_until_complete(task)
-                    self.send_weight_task[index] = None
-                except asyncio.TimeoutError:
-                    self.send_weight_task[index] = None
-                    logging.info(
-                        'Weights for layer %s were not received by server', index)
+                logging.info(
+                    'Waiting for task at index %s', str(index))
+                await task
+            # if weights are not received in timeout log
+            except asyncio.TimeoutError:
+                self.get_weight_task[index] = None
+                logging.info(
+                    'Weights for layer %s were not received in time', index)
 
     def train_one_round(self):
         self.model.set_weights(self.model_weights)
@@ -172,7 +220,7 @@ class NewProtocol(QuicConnectionProtocol):
 
         self.model_weights = self.model.get_weights()
 
-        return self.send(b':'.join([b'Sample', '{0}'.format(len(x_train)).encode()]), self.main_stream)
+        return len(x_train)
 
     async def say_in_training(self):
         while True:

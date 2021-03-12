@@ -74,7 +74,7 @@ class Server(QuicServer):
                 client_protocols.add(proto)
         return client_protocols
 
-    async def train_model(self, client_protocols, num_rounds=10, min_clients=3):
+    async def train_model(self, client_protocols, num_rounds=10, min_clients=1):
         '''Function called by the server to train the model
         '''
         print(client_protocols)
@@ -90,6 +90,7 @@ class Server(QuicServer):
             eval_results = self.fl_model.evaluate(X_TEST, Y_TEST)
             # append to history
             self.performance_hystory['performance_server'].append(eval_results)
+            print(eval_results)
             # Train for number of rounds
             for rnd in range(num_rounds):
                 if client_protocols.issubset(self.find_clients()):
@@ -129,8 +130,10 @@ class Server(QuicServer):
         tasks = []
         # Create tasks for each client
         for client in clients:
-            tasks.append(self._loop.create_task(client.train))
+            tasks.append(self._loop.create_task(
+                client.train(self.model_weights)))
         # wait for tasks to finish
+        logging.info('waiting for tasks')
         for task in tasks:
             await task
         return tasks
@@ -203,6 +206,7 @@ class NewProtocol(QuicConnectionProtocol):
         '''One round of training for a client
         '''
         # End the wait task
+        logging.info('canjceling _wait_task')
         self._wait_task.cancel()
         try:
             await self._wait_task
@@ -214,40 +218,44 @@ class NewProtocol(QuicConnectionProtocol):
 
         # Build
         if not self.weight_streams:
-            self.weight_streams = [None for x in model_weights]
+            self.weight_streams = [self.create_new_stream()
+                                   for x in range(len(model_weights))]
         if not self.send_weight_task:
             self.send_weight_task = [None for x in model_weights]
         if not self.get_weight_task:
             self.get_weight_task = [None for x in model_weights]
-
+        print(self.weight_streams)
         # send the weights
         for index, weights in enumerate(model_weights):
-            # if a stream for layer does not exist create a new one
-            if self.weight_streams[i] is None:
-                self.weight_streams[i] = self.create_stream()
             # Create the message containing layer weights
             message = b':'.join(
-                [b'Weights', str(i).encode(), pickle.dumps(weights)])
+                [b'Weights', str(index).encode(), pickle.dumps(weights), b'End Weights'])
             # create a task that will signal if the weights were received by clients in Timeout
             awaitable = self._loop.create_future()
             task = self._loop.create_task(
                 asyncio.wait_for(asyncio.shield(awaitable), 60))
-            self.send_weight_task[i] = (awaitable, task)
-            # Send the message
-            self.send(message, self.weight_streams[i])
 
-        # Signal client to train as all weights were sent
-        self.send(b'Proceed to Training\n', self.main_stream)
+            self.send_weight_task[index] = (awaitable, task)
+            # Send the message
+            self.send(message, self.weight_streams[index])
+
         # wait for the client response on weights received
-        for index, task in enumerate(self.send_weight_task):
+        for index, (awaitable, task) in enumerate(self.send_weight_task):
+            print(index)
             # if client did not send ack in timeout log it
             try:
                 await task
+                print('Task at index {} finished'.format(index))
                 self.send_weight_task[index] = None
             except asyncio.TimeoutError:
                 self.send_weight_task[index] = None
                 logging.info(
                     'Weights for layer %s were not received by client', index)
+
+        # Signal client to train as all weights were sent
+        self.send(b'Proceed to Training\n', self.main_stream)
+
+        ################################################################################
         # Create wait for weights
         self.wait_weights = self._loop.create_future()
         self.wait_sample_size = self._loop.create_future()
@@ -271,7 +279,7 @@ class NewProtocol(QuicConnectionProtocol):
         return model_weights, sample_size
 
     def initiate_comunication(self):
-        stream_id = self.create_stream()
+        stream_id = self.create_new_stream()
         self.main_stream = stream_id
         self._wait_task = self._loop.create_task(self.say_wait(stream_id))
 
@@ -280,8 +288,9 @@ class NewProtocol(QuicConnectionProtocol):
             self.send(b'Wait for instructions\n', stream_id)
             await asyncio.sleep(10)
 
-    def create_stream(self):
+    def create_new_stream(self):
         stream_id = self._quic.get_next_available_stream_id()
+        self._quic._get_or_create_stream_for_send(stream_id)
         return stream_id
 
     def send(self, data, stream_id, end_stream=False):
