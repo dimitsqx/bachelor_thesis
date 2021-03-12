@@ -74,16 +74,19 @@ class Server(QuicServer):
                 client_protocols.add(proto)
         return client_protocols
 
-    async def train_model(self, client_protocols, num_rounds=10, min_clients=1):
+    async def train_model(self, client_protocols, num_rounds=2, min_clients=1):
         '''Function called by the server to train the model
         '''
+        print('All clients')
         print(client_protocols)
         if len(client_protocols) >= min_clients:
             # Sample min_clients
-            train_clients = random.sample(client_protocols, min_clients)
+            train_clients = set(random.sample(client_protocols, min_clients))
+            print('Train clients')
             print(train_clients)
             # Get remaining clients
             other_clients = client_protocols.difference(train_clients)
+            print('Other clients')
             print(other_clients)
             self.fl_model.set_weights(self.model_weights)
             # evaluate model
@@ -93,37 +96,50 @@ class Server(QuicServer):
             print(eval_results)
             # Train for number of rounds
             for rnd in range(num_rounds):
-                if client_protocols.issubset(self.find_clients()):
+                if train_clients.issubset(self.find_clients()):
                     # Get the tasks for client
                     fit_tasks = await self.fit_round(train_clients, rnd)
-                    sample_size = sum(task.result()[1]
-                                      for task in fit_tasks if task.result())
-                    new_weights = []
-                    # Add the weighted weights from each client
-                    for task in fit_tasks:
-                        results = task.result()
-                        if results:
-                            weighted = []
-                            for layer in results[0]:
-                                weighted.append((results[1]/sample_size)*layer)
-                            if not new_weights:
-                                new_weights = weighted
+                    print(fit_tasks)
+                    terminated_tasks = [task.result()
+                                        for task in fit_tasks if task.result()[1] is not None]
+                    print('Training round finished')
+                    print(terminated_tasks)
+                    print(self.model_weights)
+                    for index in range(len(self.model_weights)):
+                        # index of  task that returned weights for this layer
+                        task_returned_weights_idx = [i for i, e in enumerate(
+                            terminated_tasks) if e[0][index] is not None]
+                        print(task_returned_weights_idx)
+                        # calculate sample size for tasks that returned weights for this layer
+                        sample_size = sum(terminated_tasks[i][1]
+                                          for i in task_returned_weights_idx)
+                        print(sample_size)
+                        # get the average sum
+                        layer = None
+                        for idx in task_returned_weights_idx:
+                            weights = terminated_tasks[idx][0][index]
+                            print(type(weights))
+                            samples = terminated_tasks[idx][1]
+                            print(samples)
+                            if layer is not None:
+                                layer += (weights*samples)/sample_size
                             else:
-                                for index in range(len(new_weights)):
-                                    new_weights[index] += weighted[index]
-                    if new_weights:
-                        self.model_weights = new_weights
+                                layer = (weights*samples)/sample_size
+                                print(layer)
+                        if layer is not None:
+                            self.model_weights[index] = layer
                 else:
                     logging.info(
                         'Finished on round %s because not all clients are available', str(rnd))
                     break
-            # self.finish_training(train_clients)
+            print('Finished all rounbds')
+            self.finish_training(
+                train_clients.intersection(self.find_clients()))
 
     def finish_training(self, clients):
+        print(clients)
         for client in clients:
-            stream_id = min(client._quic._streams.keys())
-            reader, writer = client._stream_transport.get(stream_id)
-            writer.write_eof()
+            client.create_wait_task()
 
     async def fit_round(self, clients, rnd):
         logging.info('Training round %s', str(rnd))
@@ -151,6 +167,7 @@ class NewProtocol(QuicConnectionProtocol):
         self.send_weight_task = []
         self.get_weight_task = []
         self.wait_sample_size = None
+        self.new_model_weights = None
 
     def quic_event_received(self, event: QuicEvent) -> None:
         """
@@ -159,10 +176,29 @@ class NewProtocol(QuicConnectionProtocol):
         """
         if isinstance(event, ConnectionTerminated):
             print(event)
-            for reader in self._stream_readers.values():
-                reader.feed_eof()
+            if self._wait_task is not None and not self._wait_task.done():
+                self._wait_task.cancel()
+            if self.wait_weights is not None and not self.wait_weights.done():
+                self.wait_weights.set_result(None)
+            elif self.wait_weights is None:
+                self.wait_weights = self._loop.create_future()
+                self.wait_weights.set_result(None)
+            if self.wait_sample_size is not None and not self.wait_sample_size.done():
+                self.wait_sample_size.set_result(None)
+            elif self.wait_sample_size is None:
+                self.wait_sample_size = self._loop.create_future()
+                self.wait_sample_size.set_result(None)
+            for tmp in self.send_weight_task:
+                if tmp is not None and not tmp[0].done():
+                    awaitable = tmp[0]
+                    awaitable.set_result(None)
+            for tmp in self.get_weight_task:
+                if tmp is not None and not tmp[0].done():
+                    awaitable = tmp[0]
+                    awaitable.set_result(None)
+
         elif isinstance(event, StreamDataReceived):
-            print(event)
+            # print(event)
             self.message_handler(event.data, event.stream_id)
 
         elif isinstance(event, HandshakeCompleted):
@@ -187,31 +223,67 @@ class NewProtocol(QuicConnectionProtocol):
                     task = self._loop.create_task(asyncio.wait_for(
                         asyncio.shield(awaitable), 60))
                     self.get_weight_task[index] = (awaitable, task)
+                # signal get_weights_task was created
                 return self.wait_weights.set_result(None)
+            return
 
         messages = message.split(b':')
-        if messages[0] == b'Weights' and self.wait_weights is not None:
-            # wait for get wait tasks to build
-            self._loop.run_until_complete(self.wait_weights)
-            # signal the weights
-            (awaitable, task) = self.get_weight_task[int(messages[1].decode())]
-            awaitable.set_result(pickle.loads(messages[2]))
-            return self.send(b'Received Weights\n', stream_id)
-
         if messages[0] == b'Sample' and self.wait_sample_size is not None:
             # set the sample size
             self.wait_sample_size.set_result(int(messages[1].decode()))
+
+        if messages[0] == b'Weights' and self.wait_weights is not None:
+            # wait for get wait tasks to build
+            if not self.wait_weights.done():
+                self._loop.create_task(self.wait_weights)
+
+            # if message als ocontains end
+            if messages[-1] == b'End Weights':
+                self.new_model_weights[int(messages[1].decode())] = b':'.join(
+                    messages[2:-1])
+                # signal received
+                awaitable, task = self.get_weight_task[int(
+                    messages[1].decode())]
+                self.new_model_weights[int(messages[1].decode())] = pickle.loads(
+                    self.new_model_weights[int(messages[1].decode())])
+                awaitable.set_result(
+                    self.new_model_weights[int(messages[1].decode())])
+                self.send(b'Received Weights\n', stream_id)
+            else:
+                self.new_model_weights[int(messages[1].decode())] = b':'.join(
+                    messages[2:])
+            return
+
+        # When weights are send through multiple messages
+        if stream_id in self.weight_streams and self.wait_weights is not None:
+            # get the layer index
+            layer = self.weight_streams.index(stream_id)
+
+            # if the receiving of data is not done
+            if not self.get_weight_task[layer][0].done():
+                # if ende of weights signal
+                if messages[-1] == b'End Weights':
+                    self.new_model_weights[layer] += b':'.join(messages[:-1])
+                    awaitable, task = self.get_weight_task[layer]
+                    self.new_model_weights[layer] = pickle.loads(
+                        self.new_model_weights[layer])
+                    awaitable.set_result(self.new_model_weights[layer])
+                    self.send(b'Received Weights\n', stream_id)
+                else:
+                    self.new_model_weights[layer] += b':'.join(messages)
+            return
 
     async def train(self, model_weights):
         '''One round of training for a client
         '''
         # End the wait task
-        logging.info('canjceling _wait_task')
-        self._wait_task.cancel()
-        try:
-            await self._wait_task
-        except asyncio.CancelledError:
-            logging.info("_wait_task is cancelled for %s", self)
+        if self._wait_task is not None:
+            logging.info('canjceling _wait_task')
+            self._wait_task.cancel()
+            try:
+                await self._wait_task
+            except asyncio.CancelledError:
+                logging.info("_wait_task is cancelled for %s", self)
 
         # Signal send weights so client can build the receive weights tasks
         self.send(b'Sending Weights\n', self.main_stream)
@@ -224,6 +296,8 @@ class NewProtocol(QuicConnectionProtocol):
             self.send_weight_task = [None for x in model_weights]
         if not self.get_weight_task:
             self.get_weight_task = [None for x in model_weights]
+        if not self.new_model_weights:
+            self.new_model_weights = [None for x in model_weights]
         print(self.weight_streams)
         # send the weights
         for index, weights in enumerate(model_weights):
@@ -240,48 +314,59 @@ class NewProtocol(QuicConnectionProtocol):
             self.send(message, self.weight_streams[index])
 
         # wait for the client response on weights received
-        for index, (awaitable, task) in enumerate(self.send_weight_task):
+        for index, tmp in enumerate(self.send_weight_task):
             print(index)
             # if client did not send ack in timeout log it
             try:
-                await task
-                print('Task at index {} finished'.format(index))
+                await tmp[1]
                 self.send_weight_task[index] = None
             except asyncio.TimeoutError:
                 self.send_weight_task[index] = None
                 logging.info(
-                    'Weights for layer %s were not received by client', index)
+                    'Weights for layer %s were not received by client in time', index)
 
         # Signal client to train as all weights were sent
         self.send(b'Proceed to Training\n', self.main_stream)
-
-        ################################################################################
-        # Create wait for weights
-        self.wait_weights = self._loop.create_future()
-        self.wait_sample_size = self._loop.create_future()
-        wait_size_task = self._loop.create_task(self.wait_sample_size)
-        # Wait for all weights to be received back
+        print('signalled go to training')
+        # Create wait for weights signal used to create get_weights_tasks
+        if self.wait_weights is None:
+            self.wait_weights = self._loop.create_future()
+        # Create wait for sample size
+        if self.wait_sample_size is None:
+            self.wait_sample_size = self._loop.create_future()
+        # Wait for send weights message from server and create get weights tasks
         await asyncio.shield(self.wait_weights)
-        for index, (awaitable, task) in enumerate(self.get_weight_task):
-            try:
-                weights = self._loop.run_until_complete(task)
-                model_weights[index] = weights
-            except asyncio.TimeoutError:
-                self.get_weight_task[index] = None
-                model_weights[index] = None
-                logging.info(
-                    'Weights for layer %s were not received', index)
+        print('12123123')
+        # Wait for all weights to be received back
+        for index, tmp in enumerate(self.get_weight_task):
+            # if no tasks means connection dropped so skip
+            if tmp is not None:
+                try:
+                    weights = await tmp[1]
+                    self.new_model_weights[index] = weights
+                except asyncio.TimeoutError:
+                    self.get_weight_task[index] = None
+                    self.new_model_weights[index] = None
+                    logging.info(
+                        'Weights for layer %s were not received', index)
         # Reset weights wait
         self.wait_weights = None
         # Wait for sample size
-        sample_size = await wait_size_task
+        sample_size = await asyncio.shield(self.wait_sample_size)
+        print('123123123')
+        self.wait_sample_size = None
 
-        return model_weights, sample_size
+        return self.new_model_weights, sample_size
 
     def initiate_comunication(self):
         stream_id = self.create_new_stream()
         self.main_stream = stream_id
         self._wait_task = self._loop.create_task(self.say_wait(stream_id))
+
+    def create_wait_task(self):
+        # reschedule wait
+        self._wait_task = self._loop.create_task(
+            self.say_wait(self.main_stream))
 
     async def say_wait(self, stream_id):
         while True:

@@ -43,7 +43,6 @@ class NewProtocol(QuicConnectionProtocol):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._weights_tasks_waiter = None
-        self._weights_waiter_task = None
         self.training_task = None
         self.model = create_keras_model()
         self.model_weights = self.model.get_weights()
@@ -92,11 +91,8 @@ class NewProtocol(QuicConnectionProtocol):
                 # Check weights received
                 return self._loop.create_task(self.check_weights_received())
 
-            if message == b'Proceed to Training\n' and self._weights_tasks_waiter is not None:
-                print(self.model_weights)
+            if message == b'Proceed to Training\n' and self.training_task is None:
                 logging.info('proceding to training')
-                # Reset weights waiter so no new weights can be received
-                self._weights_tasks_waiter = None
                 # Create a task THAT SIGNALS TRAINING
                 self.training_task = self._loop.create_task(
                     self.say_in_training())
@@ -108,15 +104,17 @@ class NewProtocol(QuicConnectionProtocol):
                 # send sample size
                 self.send(b':'.join([b'Sample', '{0}'.format(
                     sample_size).encode()]), self.main_stream)
-    #######################################################################################
+                print('Sending weights back')
                 # Send the weights
                 for index, weight in enumerate(self.model_weights):
+                    print(index)
                     stream_id = self.weight_streams[index]
                     # IN case no stream for weights not received
                     if stream_id is None:
                         stream_id = self.create_stream()
+                    print(stream_id)
                     message = b':'.join(
-                        [b'Weights', str(index).encode(), pickle.dumps(self.model_weights[index])])
+                        [b'Weights', str(index).encode(), pickle.dumps(self.model_weights[index]), b'End Weights'])
                     # create a task that will signal if the weights were received by server in Timeout
                     awaitable = self._loop.create_future()
                     task = self._loop.create_task(
@@ -125,22 +123,14 @@ class NewProtocol(QuicConnectionProtocol):
                     # send weights
                     self.send(message, stream_id)
 
+                # signal if servwr received the weights
+                self._loop.create_task(self.log_server_received_weights())
+                print('Cancel signal in training')
                 # Cancel task that signals training
                 self.training_task.cancel()
-                try:
-                    self._loop.run_until_complete(self.training_task)
-                except asyncio.CancelledError:
-                    logging.info("Training task is cancelled for %s", self)
-                # Wait for wait received from server
-                for index, (awaitable, task) in enumerate(self.send_weight_task):
-                    try:
-                        self._loop.run_until_complete(task)
-                        self.send_weight_task[index] = None
-                    except asyncio.TimeoutError:
-                        self.send_weight_task[index] = None
-                        logging.info(
-                            'Weights for layer %s were not received by server', index)
-                return
+                # log training_signal_cancel
+                return self._loop.create_task(self.log_training_signal_cancel())
+
         else:
             messages = message.split(b':')
 
@@ -156,7 +146,7 @@ class NewProtocol(QuicConnectionProtocol):
             if messages[0] == b'Weights' and self.training_task is None and self._weights_tasks_waiter is not None:
                 # Wait for get weights task to build
                 if not self._weights_tasks_waiter.done():
-                    self._loop.run_until_complete(
+                    self._loop.create_task(
                         asyncio.shield(self._weights_tasks_waiter))
                 # store the stream id for layer
                 self.weight_streams[int(messages[1].decode())] = stream_id
@@ -179,7 +169,7 @@ class NewProtocol(QuicConnectionProtocol):
                 return
 
             # When weights are send through multiple messages
-            if stream_id in self.weight_streams:
+            if stream_id in self.weight_streams and self._weights_tasks_waiter is not None:
                 # get the layer index
                 layer = self.weight_streams.index(stream_id)
 
@@ -197,6 +187,24 @@ class NewProtocol(QuicConnectionProtocol):
                         self.model_weights[layer] += b':'.join(messages)
                 return
 
+    async def log_server_received_weights(self):
+        # Wait for wait received from server
+        for index, (awaitable, task) in enumerate(self.send_weight_task):
+            try:
+                await task
+                self.send_weight_task[index] = None
+            except asyncio.TimeoutError:
+                self.send_weight_task[index] = None
+                logging.info(
+                    'Weights for layer %s were not received by server', index)
+
+    async def log_training_signal_cancel(self):
+        try:
+            await self.training_task
+        except asyncio.CancelledError:
+            logging.info("Training task is cancelled for %s", self)
+        self.training_task = None
+
     async def check_weights_received(self):
         # Wait for all weights to be received in Timeout
         for index, (awaitable, task) in enumerate(self.get_weight_task):
@@ -209,8 +217,11 @@ class NewProtocol(QuicConnectionProtocol):
                 self.get_weight_task[index] = None
                 logging.info(
                     'Weights for layer %s were not received in time', index)
+        # Reset weights waiter so no new weights can be received
+        self._weights_tasks_waiter = None
 
     def train_one_round(self):
+        print(self.model_weights)
         self.model.set_weights(self.model_weights)
         # Load data
         x_train, y_train = DATA[next(KEYS)]
