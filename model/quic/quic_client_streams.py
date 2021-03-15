@@ -34,7 +34,7 @@ try:
     import uvloop
 except ImportError:
     uvloop = None
-with open('model/quic/EMNINST.pickle', 'rb') as fp:
+with open('model/quic/EMNINST_TRAIN.pickle', 'rb') as fp:
     DATA = pickle.load(fp)
     KEYS = iter(DATA)
 
@@ -42,54 +42,91 @@ with open('model/quic/EMNINST.pickle', 'rb') as fp:
 class NewProtocol(QuicConnectionProtocol):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self._weights_tasks_waiter = None
         self.training_task = None
         self.model = create_keras_model()
         self.model_weights = self.model.get_weights()
         self.main_stream = None
         self.weight_streams = [None for x in self.model_weights]
-        self.send_weight_task = [None for x in self.model_weights]
-        self.get_weight_task = [None for x in self.model_weights]
 
     def quic_event_received(self, event: QuicEvent) -> None:
         """
         Called when a QUIC event is received.
         Reimplement this in your subclass to handle the events.
         """
-        # FIXME: move this to a subclass
         if isinstance(event, ConnectionTerminated):
             print(event)
-            for reader in self._stream_readers.values():
+            reader = self._stream_readers.get(self.main_stream, None)
+            if reader is not None:
                 reader.feed_eof()
         elif isinstance(event, StreamDataReceived):
-            # print(event)
-            self.handle_message(event.data, event.stream_id)
+            reader = self._stream_readers.get(event.stream_id, None)
+            if reader is None:
+                reader = asyncio.StreamReader()
+                self._stream_readers[event.stream_id] = reader
+            reader.feed_data(event.data)
+            if self.main_stream is None:
+                self.main_stream = event.stream_id
+                self._loop.create_task(self.communication_handler())
 
-    def handle_message(self, message: bytes, stream_id):
+        elif isinstance(event, HandshakeCompleted):
+            logging.info(event)
 
-        if self.main_stream is None:
-            self.main_stream = stream_id
+    async def get_weights_for_layer(self, stream_id, length):
+        reader = self._stream_readers.get(stream_id)
+        if reader is None:
+            reader = asyncio.StreamReader()
+            self._stream_readers[stream_id] = reader
+        binary_weights = await reader.readexactly(length)
+        # sende received
+        self.send(b'Received Weights\n', stream_id)
+        return pickle.loads(binary_weights)
 
-        if stream_id == self.main_stream:
+    async def wait_weights_received(self, stream_id):
+        reader = self._stream_readers.get(stream_id)
+        while True:
+            line = await reader.readline()
+            if line == b'Received Weights\n':
+                return
+
+    async def communication_handler(self):
+        main_reader = self._stream_readers.get(self.main_stream)
+        while True and not main_reader.at_eof():
+            message = await main_reader.readline()
             if message == b'Wait for instructions\n':
-                return logging.info('Waiting')
-
+                logging.info('Waiting')
             if message == b'Sending Weights\n' and self.training_task is None:
                 logging.info('Waiting for weights')
-                # Create tasks to receive weights
-                # Create event that will lock access to the receive tasks untill they are built
-                self._weights_tasks_waiter = self._loop.create_future()
-                # Task to get the weights
-                for index in range(len(self.get_weight_task)):
-                    awaitable = self._loop.create_future()
+                # wait for info about lengts and stream _id for each index
+                message = await main_reader.readline()
+                # s_id:length of bite array | ...
+                receive_info = [x.split(b':') for x in message.split(b'|')]
+                for index, element in enumerate(receive_info):
+                    stream_id = int(element[0])
+                    reader = self._stream_readers.get(stream_id, None)
+                    if reader is None:
+                        reader = asyncio.StreamReader()
+                        self._stream_readers[stream_id] = reader
+                    self.weight_streams[index] = stream_id
+                get_weights_tasks = [None for i in self.model_weights]
+                for index in range(len(self.model_weights)):
+                    stream_id = int(receive_info[index][0])
+                    length = int(receive_info[index][1])
                     task = self._loop.create_task(asyncio.wait_for(
-                        asyncio.shield(awaitable), 60))
-                    self.get_weight_task[index] = (awaitable, task)
-                # allow access to get weight tasks
-                logging.info('Created get weights wait objects')
-                self._weights_tasks_waiter.set_result(None)
-                # Check weights received
-                return self._loop.create_task(self.check_weights_received())
+                        self.get_weights_for_layer(stream_id, length), 60))
+                    get_weights_tasks[index] = task
+                # Wait for all weights to be received in Timeout
+                for index, task in enumerate(get_weights_tasks):
+                    try:
+                        logging.info(
+                            'Waiting for task at index %s', str(index))
+                        weight = await task
+                        print(weight)
+                        # asign new weights to
+                        self.model_weights[index] = weight
+                    # if weights are not received in timeout log
+                    except asyncio.TimeoutError:
+                        logging.info(
+                            'Weights for layer %s were not received in time', index)
 
             if message == b'Proceed to Training\n' and self.training_task is None:
                 logging.info('proceding to training')
@@ -103,122 +140,52 @@ class NewProtocol(QuicConnectionProtocol):
                           self.main_stream)
                 # send sample size
                 self.send(b':'.join([b'Sample', '{0}'.format(
-                    sample_size).encode()]), self.main_stream)
-                print('Sending weights back')
-                # Send the weights
-                for index, weight in enumerate(self.model_weights):
-                    print(index)
+                    sample_size).encode(), b'\n']), self.main_stream)
+                # send info message
+                info_message = []
+                weights_binary = []
+                for index, layer_weights in enumerate(self.model_weights):
+                    weight_binary = pickle.dumps(layer_weights)
+                    weights_binary.append(weight_binary)
+                    lenghth = str(len(weight_binary)).encode()
                     stream_id = self.weight_streams[index]
                     # IN case no stream for weights not received
                     if stream_id is None:
                         stream_id = self.create_stream()
-                    print(stream_id)
-                    message = b':'.join(
-                        [b'Weights', str(index).encode(), pickle.dumps(self.model_weights[index]), b'End Weights'])
-                    # create a task that will signal if the weights were received by server in Timeout
-                    awaitable = self._loop.create_future()
-                    task = self._loop.create_task(
-                        asyncio.wait_for(asyncio.shield(awaitable), 60))
-                    self.send_weight_task[index] = (awaitable, task)
-                    # send weights
-                    self.send(message, stream_id)
+                        self._stream_readers[stream_id] = asyncio.StreamReader(
+                        )
+                        self.weight_streams[index] = stream_id
+                    info_message.append(
+                        b':'.join([str(stream_id).encode(), lenghth]))
+                self.send(b'|'.join(info_message)+b'\n', self.main_stream)
 
+                print('Sending weights back')
+                # Send the weights
+                received_tasks = []
+                for index, weight in enumerate(weights_binary):
+                    stream_id = self.weight_streams[index]
+                    # create a task that will signal if the weights were received by server in Timeout
+                    task = self._loop.create_task(
+                        asyncio.wait_for(self.wait_weights_received(stream_id), 60))
+                    received_tasks.append(task)
+                    self.send(weight, stream_id)
                 # signal if servwr received the weights
-                self._loop.create_task(self.log_server_received_weights())
+                for index, task in enumerate(received_tasks):
+                    try:
+                        await task
+                    except asyncio.TimeoutError:
+                        logging.info(
+                            'Weights for layer %s were not received by server in time', index)
+
                 print('Cancel signal in training')
                 # Cancel task that signals training
                 self.training_task.cancel()
                 # log training_signal_cancel
-                return self._loop.create_task(self.log_training_signal_cancel())
-
-        else:
-            messages = message.split(b':')
-
-            if messages[0] == b'Received Weights\n':
-                # get the layer index for this stream
-                wait_task_index = self.weight_streams.index(stream_id)
-                # get the waiter and task
-                awaitable, task = self.send_weight_task[wait_task_index]
-                # signal that the weights were received
-                return awaitable.set_result(None)
-
-            # if training is not in progress
-            if messages[0] == b'Weights' and self.training_task is None and self._weights_tasks_waiter is not None:
-                # Wait for get weights task to build
-                if not self._weights_tasks_waiter.done():
-                    self._loop.create_task(
-                        asyncio.shield(self._weights_tasks_waiter))
-                # store the stream id for layer
-                self.weight_streams[int(messages[1].decode())] = stream_id
-                # if message als ocontains end
-                if messages[-1] == b'End Weights':
-                    self.model_weights[int(messages[1].decode())] = b':'.join(
-                        messages[2:-1])
-                    # signal received
-                    awaitable, task = self.get_weight_task[int(
-                        messages[1].decode())]
-                    self.model_weights[int(messages[1].decode())] = pickle.loads(
-                        self.model_weights[int(messages[1].decode())])
-                    awaitable.set_result(
-                        self.model_weights[int(messages[1].decode())])
-                    self.send(b'Received Weights\n', stream_id)
-                # set the layer weights
-                else:
-                    self.model_weights[int(messages[1].decode())] = b':'.join(
-                        messages[2:])
-                return
-
-            # When weights are send through multiple messages
-            if stream_id in self.weight_streams and self._weights_tasks_waiter is not None:
-                # get the layer index
-                layer = self.weight_streams.index(stream_id)
-
-                # if the receiving of data is not done
-                if not self.get_weight_task[layer][0].done():
-                    # if ende of weights signal
-                    if messages[-1] == b'End Weights':
-                        self.model_weights[layer] += b':'.join(messages[:-1])
-                        awaitable, task = self.get_weight_task[layer]
-                        self.model_weights[layer] = pickle.loads(
-                            self.model_weights[layer])
-                        awaitable.set_result(self.model_weights[layer])
-                        self.send(b'Received Weights\n', stream_id)
-                    else:
-                        self.model_weights[layer] += b':'.join(messages)
-                return
-
-    async def log_server_received_weights(self):
-        # Wait for wait received from server
-        for index, (awaitable, task) in enumerate(self.send_weight_task):
-            try:
-                await task
-                self.send_weight_task[index] = None
-            except asyncio.TimeoutError:
-                self.send_weight_task[index] = None
-                logging.info(
-                    'Weights for layer %s were not received by server', index)
-
-    async def log_training_signal_cancel(self):
-        try:
-            await self.training_task
-        except asyncio.CancelledError:
-            logging.info("Training task is cancelled for %s", self)
-        self.training_task = None
-
-    async def check_weights_received(self):
-        # Wait for all weights to be received in Timeout
-        for index, (awaitable, task) in enumerate(self.get_weight_task):
-            try:
-                logging.info(
-                    'Waiting for task at index %s', str(index))
-                await task
-            # if weights are not received in timeout log
-            except asyncio.TimeoutError:
-                self.get_weight_task[index] = None
-                logging.info(
-                    'Weights for layer %s were not received in time', index)
-        # Reset weights waiter so no new weights can be received
-        self._weights_tasks_waiter = None
+                try:
+                    await self.training_task
+                except asyncio.CancelledError:
+                    logging.info("Training task is cancelled for %s", self)
+                self.training_task = None
 
     def train_one_round(self):
         print(self.model_weights)
@@ -260,6 +227,7 @@ def save_session_ticket(ticket: SessionTicket) -> None:
 
 
 async def run(configuration: QuicConfiguration, host: str, port: int) -> None:
+    # pylint: disable=not-async-context-manager
     async with connect(
         host,
         port,
@@ -267,28 +235,6 @@ async def run(configuration: QuicConfiguration, host: str, port: int) -> None:
         create_protocol=NewProtocol,
         session_ticket_handler=save_session_ticket,
     ) as client:
-        # stream_id = client.create_stream()
-
-        # print(client._quic._streams)
-        # await client.write(b'Hello', stream_id1)
-        # while True:
-        #     line= await reader.readline()
-        #     if line==b'Prepare for training\n':
-        #         break
-        # model = create_keras_model()
-        # writer.write(b'Ready to work\n')
-        # # print(client._quic.host_cid)
-        # # print(client._quic._peer_cid)
-
-        # while not reader.at_eof():
-        #     line = await reader.readline()
-        #     print(line)
-        #     if line == b'Proceed to Training\n':
-        #         tmp = await train_one_round(model, reader, writer)
-        # writer.write_eof()
-        # print('sent eof')
-        # print((await reader.read()))
-        # client.close()
         await client.wait_closed()
         print('closed conn')
 

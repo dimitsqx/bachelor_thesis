@@ -34,7 +34,7 @@ try:
 except ImportError:
     uvloop = None
 
-with open('model/quic/EMNINST.pickle', 'rb') as fp:
+with open('model/quic/EMNINST_TEST.pickle', 'rb') as fp:
     a = pickle.load(fp)
     for i in range(100):
         key = next(iter(a))
@@ -74,7 +74,7 @@ class Server(QuicServer):
                 client_protocols.add(proto)
         return client_protocols
 
-    async def train_model(self, client_protocols, num_rounds=2, min_clients=1):
+    async def train_model(self, client_protocols, num_rounds=2, min_clients=2):
         '''Function called by the server to train the model
         '''
         print('All clients')
@@ -101,10 +101,9 @@ class Server(QuicServer):
                     fit_tasks = await self.fit_round(train_clients, rnd)
                     print(fit_tasks)
                     terminated_tasks = [task.result()
-                                        for task in fit_tasks if task.result()[1] is not None]
+                                        for task in fit_tasks if task.result() is not None and task.result()[1] is not None]
                     print('Training round finished')
                     print(terminated_tasks)
-                    print(self.model_weights)
                     for index in range(len(self.model_weights)):
                         # index of  task that returned weights for this layer
                         task_returned_weights_idx = [i for i, e in enumerate(
@@ -118,14 +117,12 @@ class Server(QuicServer):
                         layer = None
                         for idx in task_returned_weights_idx:
                             weights = terminated_tasks[idx][0][index]
-                            print(type(weights))
+
                             samples = terminated_tasks[idx][1]
-                            print(samples)
                             if layer is not None:
                                 layer += (weights*samples)/sample_size
                             else:
                                 layer = (weights*samples)/sample_size
-                                print(layer)
                         if layer is not None:
                             self.model_weights[index] = layer
                 else:
@@ -147,7 +144,7 @@ class Server(QuicServer):
         # Create tasks for each client
         for client in clients:
             tasks.append(self._loop.create_task(
-                client.train(self.model_weights)))
+                client.train_new(self.model_weights)))
         # wait for tasks to finish
         logging.info('waiting for tasks')
         for task in tasks:
@@ -158,15 +155,9 @@ class Server(QuicServer):
 class NewProtocol(QuicConnectionProtocol):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self._stream_transport = dict()
-        self._ack_waiter = dict()
-        self.wait_weights = None
         self._wait_task = None
         self.main_stream = None
         self.weight_streams = []
-        self.send_weight_task = []
-        self.get_weight_task = []
-        self.wait_sample_size = None
         self.new_model_weights = None
 
     def quic_event_received(self, event: QuicEvent) -> None:
@@ -176,106 +167,27 @@ class NewProtocol(QuicConnectionProtocol):
         """
         if isinstance(event, ConnectionTerminated):
             print(event)
+            reader = self._stream_readers.get(self.main_stream, None)
+            if reader is not None:
+                reader.feed_eof()
             if self._wait_task is not None and not self._wait_task.done():
                 self._wait_task.cancel()
-            if self.wait_weights is not None and not self.wait_weights.done():
-                self.wait_weights.set_result(None)
-            elif self.wait_weights is None:
-                self.wait_weights = self._loop.create_future()
-                self.wait_weights.set_result(None)
-            if self.wait_sample_size is not None and not self.wait_sample_size.done():
-                self.wait_sample_size.set_result(None)
-            elif self.wait_sample_size is None:
-                self.wait_sample_size = self._loop.create_future()
-                self.wait_sample_size.set_result(None)
-            for tmp in self.send_weight_task:
-                if tmp is not None and not tmp[0].done():
-                    awaitable = tmp[0]
-                    awaitable.set_result(None)
-            for tmp in self.get_weight_task:
-                if tmp is not None and not tmp[0].done():
-                    awaitable = tmp[0]
-                    awaitable.set_result(None)
-
         elif isinstance(event, StreamDataReceived):
-            # print(event)
-            self.message_handler(event.data, event.stream_id)
-
+            reader = self._stream_readers.get(event.stream_id, None)
+            if reader is None:
+                reader = asyncio.StreamReader()
+                self._stream_readers[event.stream_id] = reader
+            reader.feed_data(event.data)
+            if self.main_stream is None:
+                self.main_stream = event.stream_id
         elif isinstance(event, HandshakeCompleted):
             logging.info(event)
             self.initiate_comunication()
 
-    def message_handler(self, message, stream_id):
-        if message == b'Received Weights\n':
-            # get the layer sent on this stream_id
-            wait_task_index = self.weight_streams.index(stream_id)
-            # get the waiter for this layer
-            (awaitable, task) = self.send_weight_task[wait_task_index]
-            # Signal that leyer results were received by client
-            return awaitable.set_result(None)
-
-        if message == b'Finished training. Sending weights back.\n':
-            if self.wait_weights is not None:
-                # Create task to wait for each layer weights
-                logging.info('Waiting for weights')
-                for index in range(len(self.get_weight_task)):
-                    awaitable = self._loop.create_future()
-                    task = self._loop.create_task(asyncio.wait_for(
-                        asyncio.shield(awaitable), 60))
-                    self.get_weight_task[index] = (awaitable, task)
-                # signal get_weights_task was created
-                return self.wait_weights.set_result(None)
-            return
-
-        messages = message.split(b':')
-        if messages[0] == b'Sample' and self.wait_sample_size is not None:
-            # set the sample size
-            self.wait_sample_size.set_result(int(messages[1].decode()))
-
-        if messages[0] == b'Weights' and self.wait_weights is not None:
-            # wait for get wait tasks to build
-            if not self.wait_weights.done():
-                self._loop.create_task(self.wait_weights)
-
-            # if message als ocontains end
-            if messages[-1] == b'End Weights':
-                self.new_model_weights[int(messages[1].decode())] = b':'.join(
-                    messages[2:-1])
-                # signal received
-                awaitable, task = self.get_weight_task[int(
-                    messages[1].decode())]
-                self.new_model_weights[int(messages[1].decode())] = pickle.loads(
-                    self.new_model_weights[int(messages[1].decode())])
-                awaitable.set_result(
-                    self.new_model_weights[int(messages[1].decode())])
-                self.send(b'Received Weights\n', stream_id)
-            else:
-                self.new_model_weights[int(messages[1].decode())] = b':'.join(
-                    messages[2:])
-            return
-
-        # When weights are send through multiple messages
-        if stream_id in self.weight_streams and self.wait_weights is not None:
-            # get the layer index
-            layer = self.weight_streams.index(stream_id)
-
-            # if the receiving of data is not done
-            if not self.get_weight_task[layer][0].done():
-                # if ende of weights signal
-                if messages[-1] == b'End Weights':
-                    self.new_model_weights[layer] += b':'.join(messages[:-1])
-                    awaitable, task = self.get_weight_task[layer]
-                    self.new_model_weights[layer] = pickle.loads(
-                        self.new_model_weights[layer])
-                    awaitable.set_result(self.new_model_weights[layer])
-                    self.send(b'Received Weights\n', stream_id)
-                else:
-                    self.new_model_weights[layer] += b':'.join(messages)
-            return
-
-    async def train(self, model_weights):
+    async def train_new(self, model_weights):
         '''One round of training for a client
         '''
+        main_reader = self._stream_readers.get(self.main_stream)
         # End the wait task
         if self._wait_task is not None:
             logging.info('canjceling _wait_task')
@@ -288,79 +200,112 @@ class NewProtocol(QuicConnectionProtocol):
         # Signal send weights so client can build the receive weights tasks
         self.send(b'Sending Weights\n', self.main_stream)
 
-        # Build
-        if not self.weight_streams:
-            self.weight_streams = [self.create_new_stream()
-                                   for x in range(len(model_weights))]
-        if not self.send_weight_task:
-            self.send_weight_task = [None for x in model_weights]
-        if not self.get_weight_task:
-            self.get_weight_task = [None for x in model_weights]
         if not self.new_model_weights:
             self.new_model_weights = [None for x in model_weights]
-        print(self.weight_streams)
-        # send the weights
-        for index, weights in enumerate(model_weights):
-            # Create the message containing layer weights
-            message = b':'.join(
-                [b'Weights', str(index).encode(), pickle.dumps(weights), b'End Weights'])
-            # create a task that will signal if the weights were received by clients in Timeout
-            awaitable = self._loop.create_future()
+        # create readers adn store idx-stream id
+        if not self.weight_streams:
+            for index in range(len(model_weights)):
+                stream_id = self.create_new_stream()
+                self.weight_streams.append(stream_id)
+                self._stream_readers[stream_id] = asyncio.StreamReader(
+                )
+        # send info message
+        info_message = []
+        weights_binary = []
+        for index, layer_weights in enumerate(model_weights):
+            weight_binary = pickle.dumps(layer_weights)
+            weights_binary.append(weight_binary)
+            lenghth = str(len(weight_binary)).encode()
+            stream_id = self.weight_streams[index]
+            # IN case no stream for weights
+            if stream_id is None:
+                stream_id = self.create_stream()
+                self._stream_readers[stream_id] = asyncio.StreamReader(
+                )
+            info_message.append(
+                b':'.join([str(stream_id).encode(), lenghth]))
+        self.send(b'|'.join(info_message)+b'\n', self.main_stream)
+
+        print('Sending weights')
+        # Send the weights
+        received_tasks = []
+        for index, weight in enumerate(weights_binary):
+            stream_id = self.weight_streams[index]
+            # create a task that will signal if the weights were received by server in Timeout
             task = self._loop.create_task(
-                asyncio.wait_for(asyncio.shield(awaitable), 60))
+                asyncio.wait_for(self.wait_weights_received(stream_id), 60))
+            received_tasks.append(task)
+            self.send(weight, stream_id)
 
-            self.send_weight_task[index] = (awaitable, task)
-            # Send the message
-            self.send(message, self.weight_streams[index])
-
-        # wait for the client response on weights received
-        for index, tmp in enumerate(self.send_weight_task):
-            print(index)
-            # if client did not send ack in timeout log it
+        # signal if servwr received the weights
+        for index, task in enumerate(received_tasks):
             try:
-                await tmp[1]
-                self.send_weight_task[index] = None
+                await task
             except asyncio.TimeoutError:
-                self.send_weight_task[index] = None
                 logging.info(
                     'Weights for layer %s were not received by client in time', index)
-
         # Signal client to train as all weights were sent
         self.send(b'Proceed to Training\n', self.main_stream)
-        print('signalled go to training')
-        # Create wait for weights signal used to create get_weights_tasks
-        if self.wait_weights is None:
-            self.wait_weights = self._loop.create_future()
-        # Create wait for sample size
-        if self.wait_sample_size is None:
-            self.wait_sample_size = self._loop.create_future()
-        # Wait for send weights message from server and create get weights tasks
-        await asyncio.shield(self.wait_weights)
-        print('12123123')
-        # Wait for all weights to be received back
-        for index, tmp in enumerate(self.get_weight_task):
-            # if no tasks means connection dropped so skip
-            if tmp is not None:
-                try:
-                    weights = await tmp[1]
-                    self.new_model_weights[index] = weights
-                except asyncio.TimeoutError:
-                    self.get_weight_task[index] = None
-                    self.new_model_weights[index] = None
-                    logging.info(
-                        'Weights for layer %s were not received', index)
-        # Reset weights wait
-        self.wait_weights = None
-        # Wait for sample size
-        sample_size = await asyncio.shield(self.wait_sample_size)
-        print('123123123')
-        self.wait_sample_size = None
+        while True and not main_reader.at_eof():
+            message = await main_reader.readline()
+            if message == b'Finished training. Sending weights back.\n':
+                sample_size_message = await main_reader.readline()
+                sample_size = int(sample_size_message.split(b':')[1])
+                info_message = await main_reader.readline()
+                # s_id:length of bite array | ...
+                receive_info = [x.split(b':')
+                                for x in info_message.split(b'|')]
+                for index, element in enumerate(receive_info):
+                    stream_id = int(element[0])
+                    reader = self._stream_readers.get(stream_id, None)
+                    # if no reader for new stream
+                    if reader is None:
+                        reader = asyncio.StreamReader()
+                        self._stream_readers[stream_id] = reader
+                    self.weight_streams[index] = stream_id
+                get_weights_tasks = [None for i in model_weights]
+                for index in range(len(model_weights)):
+                    stream_id = int(receive_info[index][0])
+                    length = int(receive_info[index][1])
+                    task = self._loop.create_task(asyncio.wait_for(
+                        self.get_weights_for_layer(stream_id, length), 60))
+                    get_weights_tasks[index] = task
+                # Wait for all weights to be received in Timeout
+                for index, task in enumerate(get_weights_tasks):
+                    try:
+                        logging.info(
+                            'Waiting for task at index %s', str(index))
+                        weight = await task
+                        # asign new weights to
+                        self.new_model_weights[index] = weight
+                    # if weights are not received in timeout log
+                    except asyncio.TimeoutError:
+                        logging.info(
+                            'Weights for layer %s were not received in time', index)
+                return self.new_model_weights, sample_size
 
-        return self.new_model_weights, sample_size
+    async def get_weights_for_layer(self, stream_id, length):
+        reader = self._stream_readers.get(stream_id)
+        if reader is None:
+            reader = asyncio.StreamReader()
+            self._stream_readers[stream_id] = reader
+        binary_weights = await reader.readexactly(length)
+        # sende received
+        self.send(b'Received Weights\n', stream_id)
+        return pickle.loads(binary_weights)
+
+    async def wait_weights_received(self, stream_id):
+        reader = self._stream_readers.get(stream_id)
+        while True:
+            line = await reader.readline()
+            print(line)
+            if line == b'Received Weights\n':
+                return
 
     def initiate_comunication(self):
         stream_id = self.create_new_stream()
         self.main_stream = stream_id
+        self._stream_readers[stream_id] = asyncio.StreamReader()
         self._wait_task = self._loop.create_task(self.say_wait(stream_id))
 
     def create_wait_task(self):
