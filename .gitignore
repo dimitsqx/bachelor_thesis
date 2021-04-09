@@ -2,7 +2,7 @@ __pycache__/
 
 
 logs/
-
+client_weights/
 
 *.pickle
 *.log
