@@ -1,5 +1,6 @@
 import asyncio
 import pickle
+from timeit import default_timer as timer
 
 
 async def send_model_weights(weights, reader, writer):
@@ -14,12 +15,14 @@ async def send_model_weights(weights, reader, writer):
     # print(line)
     if line == b'Got pickle length\n':
         # print('in ifff')
+        start = timer()
         writer.write(weights_binary)
         # print('sent weights')
     line = await asyncio.wait_for(reader.readline(), timeout=60)
     # print(line)
     if line == b'Got Model Weights\n':
-        return True
+        end = timer()
+        return start, end
 
 
 async def get_model_weights(reader, writer):

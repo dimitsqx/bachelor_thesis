@@ -6,15 +6,16 @@ import pickle
 import ssl
 import time
 import tensorflow as tf
+import numpy as np
 from collections import deque
 from typing import BinaryIO, Callable, Deque, Dict, List, Optional, Union, cast, Tuple
 from urllib.parse import urlparse
 import socket
-
+import random
 import wsproto
 import wsproto.events
 from quic_logger import QuicDirectoryLogger
-
+from pathlib import Path
 import aioquic
 from aioquic.asyncio import connect
 from aioquic.asyncio.protocol import QuicConnectionProtocol
@@ -35,9 +36,9 @@ try:
     import uvloop
 except ImportError:
     uvloop = None
-with open('model/quic/EMNINST.pickle', 'rb') as fp:
+with open('model/quic/EMNINST_TRAIN.pickle', 'rb') as fp:
     DATA = pickle.load(fp)
-    KEYS = iter(DATA)
+    CLIENTS = list(DATA.keys())
 
 
 class NewProtocol(QuicConnectionProtocol):
@@ -75,14 +76,22 @@ def save_session_ticket(ticket: SessionTicket) -> None:
             pickle.dump(ticket, fp)
 
 
-async def train_one_round(model, reader, writer):
+async def train_one_round(model, reader, writer, client):
     model_weights = await get_model_weights(reader, writer)
     model.set_weights(model_weights)
     # Load data
-    x_train, y_train = DATA[next(KEYS)]
-    # Start training
+    x_train, y_train = None, None
+    for key in client:
+        if x_train is None and y_train is None:
+            x_train, y_train = DATA[key]
+        else:
+            x, y = DATA[key]
+            np.concatenate((x_train, x), axis=0)
+            np.concatenate((y_train, y), axis=0)
+# Start training
     writer.write(b'Start model train\n')
-    model.fit(x_train, y_train, epochs=15, batch_size=40, validation_split=0.2)
+    model.fit(x_train, y_train, epochs=10, batch_size=40,
+              validation_split=0.2, verbose=0)
     writer.write(b'Finished Round\n')
     # Wait for server to ack
     line = await reader.readline()
@@ -92,7 +101,8 @@ async def train_one_round(model, reader, writer):
         writer.write('{0}\n'.format(len(x_train)).encode())
 
 
-async def run(configuration: QuicConfiguration, host: str, port: int) -> None:
+async def connect_client(configuration: QuicConfiguration, host: str, port: int, client):
+    # pylint: disable=not-async-context-manager
     async with connect(
         host,
         port,
@@ -114,13 +124,62 @@ async def run(configuration: QuicConfiguration, host: str, port: int) -> None:
             line = await reader.readline()
             print(line)
             if line == b'Proceed to Training\n':
-                tmp = await train_one_round(model, reader, writer)
+                tmp = await train_one_round(model, reader, writer, client)
         writer.write_eof()
-        print('sent eof')
+        # print('sent eof')
         print((await reader.read()))
         client.close()
         await client.wait_closed()
         print('closed conn')
+
+
+async def run(configuration: QuicConfiguration, host: str, port: int, index=0) -> None:
+    try:
+        with tf.device('cpu:0'):
+            loop = asyncio.get_event_loop()
+            clients = []
+            for i in range(100):
+                path = 'model/quic/client_weights/{}'.format(i)
+                f = Path(path)
+                if f.is_file():
+                    print(i)
+                    with open(path, 'rb') as fp:
+                        client = pickle.load(fp)
+                else:
+                    if i == 99:
+                        client = {
+                            'index': i,
+                            'weights': None,
+                            'ids': CLIENTS[i*33:]
+                        }
+                    else:
+                        client = {
+                            'index': i,
+                            'weights': None,
+                            'ids': CLIENTS[i*33:(i+1)*33]
+                        }
+                clients.append(client)
+            # clients = set(CLIENTS)
+            i = index
+            tasks = []
+            # while True:
+            # cl = random.sample(clients, 350)
+            # used_clients.update(cl)
+            for client in clients:
+                task = loop.create_task(connect_client(
+                    configuration, host, port, client))
+                tasks.append(task)
+            print(len(tasks))
+            for task in tasks:
+                await task
+            del tasks[:]
+            print('finished round {}'.format(i))
+            i += 1
+    except:
+        for task in tasks:
+            task.cancel()
+        del tasks[:]
+        return i
 
 if __name__ == "__main__":
     defaults = QuicConfiguration(is_client=True)
@@ -146,12 +205,14 @@ if __name__ == "__main__":
             configuration.session_ticket = pickle.load(fp)
     except FileNotFoundError:
         pass
-    with tf.device('cpu:0'):
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(
-            run(
-                configuration=configuration,
-                host='localhost',
-                port=4433
-            )
+
+    loop = asyncio.get_event_loop()
+
+    task = loop.run_until_complete(
+        run(
+            configuration=configuration,
+            host='192.168.1.129',
+            port=4433,
+            index=0
         )
+    )

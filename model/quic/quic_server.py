@@ -14,6 +14,8 @@ import wsproto.events
 from quic_logger import QuicDirectoryLogger
 import pickle
 import aioquic
+from pathlib import Path
+
 import numpy as np
 from aioquic.asyncio import QuicConnectionProtocol, serve
 from aioquic.asyncio.server import QuicServer
@@ -34,16 +36,16 @@ try:
 except ImportError:
     uvloop = None
 
-with open('model/quic/EMNINST.pickle', 'rb') as fp:
+with open('model/quic/EMNINST_TEST.pickle', 'rb') as fp:
     a = pickle.load(fp)
-    for i in range(100):
-        key = next(iter(a))
-    X_TEST, Y_TEST = a[key]
-    for i in range(400):
-        key = next(iter(a))
-        x, y = a[key]
-        np.concatenate((X_TEST, x), axis=0)
-        np.concatenate((Y_TEST, y), axis=0)
+    X_TEST, Y_TEST = None, None
+    for key in a:
+        if X_TEST is None and Y_TEST is None:
+            X_TEST, Y_TEST = a[key]
+        else:
+            x, y = a[key]
+            np.concatenate((X_TEST, x), axis=0)
+            np.concatenate((Y_TEST, y), axis=0)
 
 
 class Server(QuicServer):
@@ -51,21 +53,34 @@ class Server(QuicServer):
     def __init__(self, keras_model: tf.keras.models.Model, model_weights_path: str = None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.fl_model = keras_model
-        self.model_weights = self.fl_model.load_weights(
-            model_weights_path) if model_weights_path is not None else self.fl_model.get_weights()
-        self.performance_hystory = {
-            'performance_server': [],
-            'performance_clients': []
-        }
+        path = 'model/quic/server_weights'
+        f = Path(path)
+        if f.is_file():
+            print('asdasd')
+            with open(path, 'rb') as fp:
+                self.model_weights = pickle.load(fp)
+        else:
+            self.model_weights = self.fl_model.get_weights()
+        path = 'model/quic/history.pickle'
+        f = Path(path)
+        if f.is_file():
+            print('asdasd')
+            with open(path, 'rb') as fp:
+                self.performance_hystory = pickle.load(fp)
+        else:
+            self.performance_hystory = []
         self.train_flag = False
         self.server_task = self._loop.create_task(self._create_server_task())
 
     async def _create_server_task(self):
         '''Create running task for training
         '''
+        i = 0
         while True:
-            await asyncio.sleep(10)
+            await asyncio.sleep(5)
+            print(i)
             await self.train_model(self.find_clients())
+            i += 1
 
     def find_clients(self):
         client_protocols = set()
@@ -74,60 +89,82 @@ class Server(QuicServer):
                 client_protocols.add(proto)
         return client_protocols
 
-    async def train_model(self, client_protocols, num_rounds=10, min_clients=3):
+    async def train_model(self, client_protocols, num_rounds=10, min_clients=10):
         '''Function called by the server to train the model
         '''
-        print(client_protocols)
+        if len(self.performance_hystory) == 30:
+            with open('model/quic/history.pickle', 'wb') as fp:
+                pickle.dump(self.performance_hystory, fp)
+            sys.exit()
+        # print(client_protocols)
         if len(client_protocols) >= min_clients:
+            history = {
+                'client_info': [],
+                'accuracy': None
+            }
             # Sample min_clients
             train_clients = random.sample(client_protocols, min_clients)
-            print(train_clients)
+            # PROB
+            # print(train_clients)
             # Get remaining clients
             other_clients = client_protocols.difference(train_clients)
-            print(other_clients)
+            # print(other_clients)
             # Create task to make others wait
             if other_clients:
                 wait_task = self._loop.create_task(
                     self.signal_waiting(other_clients))
+
+            if client_protocols.issubset(self.find_clients()):
+                # Get the tasks for client
+                fit_tasks = await self.fit_round(train_clients)
+                # Prob
+                terminated_tasks = []
+                for task in fit_tasks:
+                    if task.result() is not None:
+                        weights = task.result()[0]
+                        # with x% chance drop the weights
+                        samples = task.result()[1]
+                        start = task.result()[2]
+                        end = task.result()[3]
+                        history['client_info'].append({
+                            # 'weights': weights,
+                            # 'samples': samples,
+                            'send_time': (start, end)
+                        })
+                        if task.result()[1] is not None:
+                            terminated_tasks.append((weights, samples))
+                    else:
+                        history['client_info'].append(None)
+
+                sample_size = sum(task[1]
+                                  for task in terminated_tasks)
+                new_weights = []
+                # Add the weighted weights from each client
+                print(len(terminated_tasks))
+                for task in terminated_tasks:
+                    weighted = []
+                    for layer in task[0]:
+                        weighted.append((task[1]/sample_size)*layer)
+                    if not new_weights:
+                        new_weights = weighted
+                    else:
+                        for index in range(len(new_weights)):
+                            new_weights[index] += weighted[index]
+                if new_weights:
+                    self.model_weights = new_weights
             self.fl_model.set_weights(self.model_weights)
             # evaluate model
             eval_results = self.fl_model.evaluate(X_TEST, Y_TEST)
-            # append to history
-            self.performance_hystory['performance_server'].append(eval_results)
-            # Train for number of rounds
-            for rnd in range(num_rounds):
-                if client_protocols.issubset(self.find_clients()):
-                    # Get the tasks for client
-                    fit_tasks = await self.fit_round(train_clients, rnd)
-                    sample_size = sum(task.result()[1]
-                                      for task in fit_tasks if task.result())
-                    new_weights = []
-                    # Add the weighted weights from each client
-                    for task in fit_tasks:
-                        results = task.result()
-                        if results:
-                            weighted = []
-                            for layer in results[0]:
-                                weighted.append((results[1]/sample_size)*layer)
-                            if not new_weights:
-                                new_weights = weighted
-                            else:
-                                for index in range(len(new_weights)):
-                                    new_weights[index] += weighted[index]
-                    if new_weights:
-                        self.model_weights = new_weights
-                else:
-                    logging.info(
-                        'Finished on round %s because not all clients are available', str(rnd))
-                    break
-            # self.finish_training(train_clients)
-
+            history['accuracy'] = eval_results
+            print(eval_results)
+            self.performance_hystory.append(history)
             if other_clients:
                 wait_task.cancel()
                 try:
                     await wait_task
                 except asyncio.CancelledError:
                     logging.info("wait_task is cancelled now")
+            self.finish_training(train_clients)
         else:
             # Wait for min clients
             await self.say_wait(client_protocols)
@@ -137,9 +174,9 @@ class Server(QuicServer):
             stream_id = min(client._quic._streams.keys())
             reader, writer = client._stream_transport.get(stream_id)
             writer.write_eof()
+            client.close()
 
-    async def fit_round(self, clients, rnd):
-        logging.info('Training round %s', str(rnd))
+    async def fit_round(self, clients):
         tasks = []
         # Create tasks for each client
         for client in clients:
@@ -172,7 +209,7 @@ class Server(QuicServer):
                 # get sample size
                 line = await asyncio.wait_for(reader.readline(), timeout=60)
                 sample_size = int(line)
-                return (new_model_weights, sample_size)
+                return new_model_weights, sample_size, ans[0], ans[1]
         except asyncio.TimeoutError:
             logging.warning('One client did not respond in time')
 
@@ -277,7 +314,7 @@ if __name__ == "__main__":
     with tf.device('cpu:0'):
 
         quic_logger = QuicDirectoryLogger(
-            "C:\\Users\\Eugen\\OneDrive - King's College London\\thesis\\model\\quic\\logs")
+            "model\\quic\\logs")
 
         quic_configuration = QuicConfiguration(
             is_client=False,
@@ -285,14 +322,14 @@ if __name__ == "__main__":
         )
 
         # load SSL certificate and key
-        quic_configuration.load_cert_chain("c:/Users/Eugen/OneDrive - King's College London/thesis/model/quic/ssl_cert.pem",
-                                           "c:/Users/Eugen/OneDrive - King's College London/thesis/model/quic/ssl_key.pem")
+        quic_configuration.load_cert_chain("model/quic/ssl_cert.pem",
+                                           "model/quic/ssl_key.pem")
 
         ticket_store = SessionTicketStore()
         _loop = asyncio.get_event_loop()
         _loop.run_until_complete(
             serve_new(
-                'localhost',
+                '0.0.0.0',
                 4433,
                 configuration=quic_configuration,
                 create_protocol=NewProtocol,
